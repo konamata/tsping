@@ -3,21 +3,26 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"github.com/schollz/progressbar/v3"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/olekukonko/tablewriter"
 	"os"
 )
 
 type PingResult struct {
-	host     string
-	publicIP string
-	port     string
-	pings    []string
+	host       string
+	externalIP string
+	port       string
+	pings      []string
 }
 
 func getTailscaleIPs() ([]string, error) {
@@ -47,7 +52,7 @@ func getTailscaleIPs() ([]string, error) {
 	return ips, nil
 }
 
-func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult) {
+func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed *int32) {
 	defer wg.Done()
 
 	var cmd *exec.Cmd
@@ -59,6 +64,7 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult) {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		atomic.AddInt32(completed, 1)
 		return
 	}
 
@@ -69,7 +75,7 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult) {
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		if match := publicIPPattern.FindStringSubmatch(line); match != nil {
-			result.publicIP = match[1]
+			result.externalIP = match[1]
 			result.port = match[2]
 		}
 		if match := pingPattern.FindStringSubmatch(line); match != nil {
@@ -77,6 +83,7 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult) {
 		}
 	}
 
+	atomic.AddInt32(completed, 1)
 	results <- result
 }
 
@@ -93,22 +100,98 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	results := make(chan PingResult, len(ips))
+	var completed int32 = 0
+	total := int32(len(ips))
+	var resultsList []PingResult
 
+	// Channels
+	results := make(chan PingResult, len(ips))
+	resultsDone := make(chan bool)
+	progressDone := make(chan bool)
+	timeout := time.After(10 * time.Second)
+
+	// Progress bar setup
+	bar := progressbar.NewOptions(int(total),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionSetWidth(15),
+		progressbar.OptionSetDescription("[cyan]Pinging...[reset]"),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "[green]=[reset]",
+			SaucerHead:    "[green]>[reset]",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+		progressbar.OptionSetWriter(os.Stderr), // Ensures real-time output
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
+	// Start ping goroutines
 	for _, ip := range ips {
 		wg.Add(1)
-		go pingIP(ip, &wg, results)
+		go pingIP(ip, &wg, results, &completed)
 	}
 
+	// Results collector
+	go func() {
+		for result := range results {
+			resultsList = append(resultsList, result)
+		}
+		resultsDone <- true
+	}()
+
+	// Progress reporter
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				current := atomic.LoadInt32(&completed)
+				err := bar.Set(int(current))
+				if err != nil {
+					return
+				}
+			case <-progressDone:
+				err := bar.Finish()
+				if err != nil {
+					return
+				}
+				return
+			}
+		}
+	}()
+
+	// Wait for all pings to complete
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"Host", "Public IP", "Port", "Pings (ms)"})
+	// Wait for completion or timeout
+	select {
+	case <-timeout:
+		fmt.Printf("\nTimeout reached. Collected %d/%d results.\n", atomic.LoadInt32(&completed), total)
+	case <-resultsDone:
+		fmt.Printf("\nAll results collected successfully.\n")
+	}
 
+	close(progressDone)
+
+	// Sort by average ping time
+	sort.Slice(resultsList, func(i, j int) bool {
+		iAvg := calculateAverage(resultsList[i].pings)
+		jAvg := calculateAverage(resultsList[j].pings)
+		return iAvg < jAvg
+	})
+
+	// Table setup and render
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Host", "External IP", "Port", "Pings (ms)"})
 	table.SetAutoFormatHeaders(false)
+
 	table.SetHeaderColor(
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
@@ -128,15 +211,23 @@ func main() {
 	table.SetAutoMergeCells(false)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 
-	for result := range results {
+	for _, result := range resultsList {
 		pings := strings.Join(result.pings, ", ")
 		table.Append([]string{
 			result.host,
-			result.publicIP,
+			result.externalIP,
 			result.port,
 			pings,
 		})
 	}
-
 	table.Render()
+}
+
+func calculateAverage(pings []string) float64 {
+	sum := 0
+	for _, p := range pings {
+		val, _ := strconv.Atoi(p)
+		sum += val
+	}
+	return float64(sum) / float64(len(pings))
 }

@@ -103,11 +103,11 @@ func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "ping", "--until-direct=false", "-c", "3", result.ip)
+		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "ping", "--until-direct=false", "-c", "5", result.ip)
 	case "linux":
-		cmd = exec.Command("tailscale", "ping", "--until-direct=false", "-c", "3", result.ip)
+		cmd = exec.Command("tailscale", "ping", "--until-direct=false", "-c", "5", result.ip)
 	case "darwin":
-		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "ping", "--until-direct=false", "-c", "3", result.ip)
+		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "ping", "--until-direct=false", "-c", "5", result.ip)
 	default:
 		atomic.AddInt32(completed, 1)
 		return
@@ -256,20 +256,20 @@ func main() {
 
 	// Table setup and render
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"#", "Group", "User", "Hostname", "OS", "Tailscale IP", "External IP", "Port", "Pings (ms)"})
+	table.SetHeader([]string{"#", "User", "Hostname", "OS", "Tailscale IP", "Group", "External IP", "Port", "Pings (ms)"})
 	table.SetAutoFormatHeaders(false)
 
 	// Add this line to set column alignments
 	table.SetColumnAlignment([]int{
 		tablewriter.ALIGN_LEFT,   // #
-		tablewriter.ALIGN_CENTER, // Group
 		tablewriter.ALIGN_LEFT,   // User
 		tablewriter.ALIGN_LEFT,   // Hostname
 		tablewriter.ALIGN_CENTER, // OS
 		tablewriter.ALIGN_LEFT,   // Tailscale IP
+		tablewriter.ALIGN_CENTER, // Group
 		tablewriter.ALIGN_LEFT,   // External IP
 		tablewriter.ALIGN_CENTER, // Port
-		tablewriter.ALIGN_CENTER, // Pings
+		tablewriter.ALIGN_RIGHT,  // Pings
 	})
 
 	table.SetHeaderColor(
@@ -286,13 +286,13 @@ func main() {
 
 	table.SetColumnColor(
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
-		tablewriter.Colors{tablewriter.FgMagentaColor},
 		tablewriter.Colors{tablewriter.FgGreenColor},
 		tablewriter.Colors{tablewriter.FgYellowColor},
 		tablewriter.Colors{tablewriter.FgHiRedColor},
 		tablewriter.Colors{tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.FgBlueColor},
-		tablewriter.Colors{tablewriter.FgBlueColor},
+		tablewriter.Colors{tablewriter.FgMagentaColor},
+		tablewriter.Colors{tablewriter.FgCyanColor},
+		tablewriter.Colors{tablewriter.FgCyanColor},
 		tablewriter.Colors{tablewriter.FgWhiteColor},
 	)
 
@@ -310,11 +310,11 @@ func main() {
 		}
 		table.Append([]string{
 			strconv.Itoa(i),
-			groupStr,
 			result.user,
 			result.hostname,
 			result.os,
 			result.ip,
+			groupStr,
 			result.externalIP,
 			result.port,
 			pings,

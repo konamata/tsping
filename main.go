@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"github.com/schollz/progressbar/v3"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -14,8 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
+
 	"github.com/olekukonko/tablewriter"
-	"os"
 )
 
 type PingResult struct {
@@ -29,8 +30,10 @@ func getTailscaleIPs() ([]string, error) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "status")
-	} else {
+	} else if runtime.GOOS == "linux" {
 		cmd = exec.Command("tailscale", "status")
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "status")
 	}
 
 	output, err := cmd.Output()
@@ -44,12 +47,28 @@ func getTailscaleIPs() ([]string, error) {
 		line := scanner.Text()
 		if !strings.Contains(line, "offline") {
 			fields := strings.Fields(line)
-			if len(fields) > 1 && strings.Contains(fields[1], ".") {
+			if len(fields) > 0 && strings.Contains(fields[0], ".") {
 				ips = append(ips, fields[1])
 			}
 		}
 	}
 	return ips, nil
+}
+
+func checkTailscale() error {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "version")
+	} else if runtime.GOOS == "linux" {
+		cmd = exec.Command("tailscale", "version")
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "version")
+	}
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("tailscale is not installed or not running: %v", err)
+	}
+	return nil
 }
 
 func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed *int32) {
@@ -58,8 +77,10 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "ping", "--until-direct=false", "-c", "5", ip)
-	} else {
+	} else if runtime.GOOS == "linux" {
 		cmd = exec.Command("tailscale", "ping", "--until-direct=false", "-c", "5", ip)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "ping", "--until-direct=false", "-c", "5", ip)
 	}
 
 	output, err := cmd.CombinedOutput()
@@ -81,6 +102,14 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed 
 		if match := pingPattern.FindStringSubmatch(line); match != nil {
 			result.pings = append(result.pings, match[1])
 		}
+	}
+
+	// Ensure externalIP and port are set to "N/A" if not found
+	if result.externalIP == "" {
+		result.externalIP = "N/A"
+	}
+	if result.port == "" {
+		result.port = "N/A"
 	}
 
 	atomic.AddInt32(completed, 1)
@@ -123,9 +152,7 @@ func main() {
 			BarEnd:        "]",
 		}),
 		progressbar.OptionSetWriter(os.Stderr), // Ensures real-time output
-		progressbar.OptionOnCompletion(func() {
-			fmt.Println()
-		}),
+		progressbar.OptionOnCompletion(nil),
 	)
 
 	// Start ping goroutines
@@ -156,6 +183,8 @@ func main() {
 				}
 			case <-progressDone:
 				err := bar.Finish()
+
+				fmt.Println()
 				if err != nil {
 					return
 				}

@@ -59,7 +59,6 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult) {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Error pinging %s: %v\n", ip, err)
 		return
 	}
 

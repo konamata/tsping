@@ -1,4 +1,4 @@
-module tsping
+module github.com/konamata/tsping
 
 go 1.23.3
 

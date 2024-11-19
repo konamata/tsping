@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -12,28 +13,33 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
-
-	"github.com/schollz/progressbar/v3"
 
 	"github.com/olekukonko/tablewriter"
+	"github.com/schollz/progressbar/v3"
 )
 
 type PingResult struct {
-	host       string
+	ip         string
+	hostname   string
+	user       string
+	os         string
 	externalIP string
 	port       string
 	pings      []string
+	group      int
 }
 
-func getTailscaleIPs() ([]string, error) {
+func getTailscaleStatus() ([]PingResult, error) {
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "status")
-	} else if runtime.GOOS == "linux" {
+	case "linux":
 		cmd = exec.Command("tailscale", "status")
-	} else if runtime.GOOS == "darwin" {
+	case "darwin":
 		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "status")
+	default:
+		return nil, fmt.Errorf("unsupported OS")
 	}
 
 	output, err := cmd.Output()
@@ -41,28 +47,48 @@ func getTailscaleIPs() ([]string, error) {
 		return nil, fmt.Errorf("tailscale status error: %v", err)
 	}
 
-	var ips []string
+	var results []PingResult
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.Contains(line, "offline") {
-			fields := strings.Fields(line)
-			if len(fields) > 0 && strings.Contains(fields[0], ".") {
-				ips = append(ips, fields[1])
-			}
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.Contains(line, "Self") {
+			continue
 		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		status := strings.Join(fields[4:], " ")
+		if strings.Contains(status, "offline") {
+			continue
+		}
+
+		result := PingResult{
+			ip:       fields[0],
+			hostname: fields[1],
+			user:     fields[2],
+			os:       fields[3],
+		}
+
+		results = append(results, result)
 	}
-	return ips, nil
+	return results, nil
 }
 
 func checkTailscale() error {
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "version")
-	} else if runtime.GOOS == "linux" {
+	case "linux":
 		cmd = exec.Command("tailscale", "version")
-	} else if runtime.GOOS == "darwin" {
+	case "darwin":
 		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "version")
+	default:
+		return fmt.Errorf("unsupported OS")
 	}
 
 	if err := cmd.Run(); err != nil {
@@ -71,16 +97,20 @@ func checkTailscale() error {
 	return nil
 }
 
-func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed *int32) {
-	defer wg.Done()
+func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
+	defer wg.Done() // Only one Done() call here
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "ping", "--until-direct=false", "-c", "5", ip)
-	} else if runtime.GOOS == "linux" {
-		cmd = exec.Command("tailscale", "ping", "--until-direct=false", "-c", "5", ip)
-	} else if runtime.GOOS == "darwin" {
-		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "ping", "--until-direct=false", "-c", "5", ip)
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("C:\\Program Files\\Tailscale\\tailscale.exe", "ping", "--until-direct=false", "-c", "3", result.ip)
+	case "linux":
+		cmd = exec.Command("tailscale", "ping", "--until-direct=false", "-c", "3", result.ip)
+	case "darwin":
+		cmd = exec.Command("/Applications/Tailscale.app/Contents/MacOS/tailscale", "ping", "--until-direct=false", "-c", "3", result.ip)
+	default:
+		atomic.AddInt32(completed, 1)
+		return
 	}
 
 	output, err := cmd.CombinedOutput()
@@ -89,8 +119,7 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed 
 		return
 	}
 
-	result := PingResult{host: ip}
-	publicIPPattern := regexp.MustCompile(`via (\d+\.\d+\.\d+\.\d+):(\d+) in (\d+)ms`)
+	publicIPPattern := regexp.MustCompile(`via (\d+\.\d+\.\d+\.\d+):(\d+)`)
 	pingPattern := regexp.MustCompile(`in (\d+)ms`)
 
 	lines := strings.Split(string(output), "\n")
@@ -104,40 +133,71 @@ func pingIP(ip string, wg *sync.WaitGroup, results chan<- PingResult, completed 
 		}
 	}
 
-	// Ensure externalIP and port are set to "N/A" if not found
-	if result.externalIP == "" {
-		result.externalIP = "N/A"
-	}
-	if result.port == "" {
-		result.port = "N/A"
+	atomic.AddInt32(completed, 1)
+}
+
+func isPublicIP(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
 	}
 
-	atomic.AddInt32(completed, 1)
-	results <- result
+	// Define private IP ranges
+	privateBlocks := []string{
+		"10.0.0.0/8",
+		"127.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16", // Link-local addresses
+		"100.64.0.0/10",  // Carrier-grade NAT
+	}
+
+	for _, cidr := range privateBlocks {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block.Contains(parsedIP) {
+			return false
+		}
+	}
+
+	// If not private, it's public
+	return true
+}
+
+func calculateAverage(pings []string) float64 {
+	sum := 0
+	for _, p := range pings {
+		val, err := strconv.Atoi(p)
+		if err == nil {
+			sum += val
+		}
+	}
+	if len(pings) == 0 {
+		return 0
+	}
+	return float64(sum) / float64(len(pings))
 }
 
 func main() {
-	ips, err := getTailscaleIPs()
+	err := checkTailscale()
 	if err != nil {
-		fmt.Printf("Error getting IPs: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	if len(ips) == 0 {
+	resultsList, err := getTailscaleStatus()
+	if err != nil {
+		fmt.Printf("Error getting Tailscale status: %v\n", err)
+		return
+	}
+
+	if len(resultsList) == 0 {
 		fmt.Println("No active Tailscale IPs found")
 		return
 	}
 
 	var wg sync.WaitGroup
-	var completed int32 = 0
-	total := int32(len(ips))
-	var resultsList []PingResult
-
-	// Channels
-	results := make(chan PingResult, len(ips))
-	resultsDone := make(chan bool)
-	progressDone := make(chan bool)
-	timeout := time.After(10 * time.Second)
+	var completed int32
+	total := int32(len(resultsList))
 
 	// Progress bar setup
 	bar := progressbar.NewOptions(int(total),
@@ -151,66 +211,44 @@ func main() {
 			BarStart:      "[",
 			BarEnd:        "]",
 		}),
-		progressbar.OptionSetWriter(os.Stderr), // Ensures real-time output
-		progressbar.OptionOnCompletion(nil),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprintf(os.Stderr, "\n") // Add newline after progress bar completion
+		}),
 	)
 
 	// Start ping goroutines
-	for _, ip := range ips {
+	for i := range resultsList {
 		wg.Add(1)
-		go pingIP(ip, &wg, results, &completed)
+		go func(result *PingResult) {
+			pingIP(result, &wg, &completed)
+			bar.Add(1)
+		}(&resultsList[i])
 	}
 
-	// Results collector
-	go func() {
-		for result := range results {
-			resultsList = append(resultsList, result)
+	wg.Wait()
+
+	// Assign group numbers based on external IP if external IP is not empty and is public
+	groupMap := make(map[string]int)
+	groupCounter := 1
+
+	for i := range resultsList {
+		externalIP := resultsList[i].externalIP
+		if externalIP == "" || !isPublicIP(externalIP) {
+			continue // Skip if external IP is empty or not public
 		}
-		resultsDone <- true
-	}()
-
-	// Progress reporter
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				current := atomic.LoadInt32(&completed)
-				err := bar.Set(int(current))
-				if err != nil {
-					return
-				}
-			case <-progressDone:
-				err := bar.Finish()
-
-				fmt.Println()
-				if err != nil {
-					return
-				}
-				return
-			}
+		if _, exists := groupMap[externalIP]; !exists {
+			groupMap[externalIP] = groupCounter
+			groupCounter++
 		}
-	}()
-
-	// Wait for all pings to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Wait for completion or timeout
-	select {
-	case <-timeout:
-		fmt.Printf("\nTimeout reached. Collected %d/%d results.\n", atomic.LoadInt32(&completed), total)
-	case <-resultsDone:
-		fmt.Printf("\nAll results collected successfully.\n")
+		resultsList[i].group = groupMap[externalIP]
 	}
 
-	close(progressDone)
-
-	// Sort by average ping time
+	// Sort the resultsList
 	sort.Slice(resultsList, func(i, j int) bool {
+		if resultsList[i].group != resultsList[j].group {
+			return resultsList[i].group < resultsList[j].group
+		}
 		iAvg := calculateAverage(resultsList[i].pings)
 		jAvg := calculateAverage(resultsList[j].pings)
 		return iAvg < jAvg
@@ -218,10 +256,28 @@ func main() {
 
 	// Table setup and render
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"Host", "External IP", "Port", "Pings (ms)"})
+	table.SetHeader([]string{"#", "Group", "User", "Hostname", "OS", "Tailscale IP", "External IP", "Port", "Pings (ms)"})
 	table.SetAutoFormatHeaders(false)
 
+	// Add this line to set column alignments
+	table.SetColumnAlignment([]int{
+		tablewriter.ALIGN_LEFT,   // #
+		tablewriter.ALIGN_CENTER, // Group
+		tablewriter.ALIGN_LEFT,   // User
+		tablewriter.ALIGN_LEFT,   // Hostname
+		tablewriter.ALIGN_CENTER, // OS
+		tablewriter.ALIGN_LEFT,   // Tailscale IP
+		tablewriter.ALIGN_LEFT,   // External IP
+		tablewriter.ALIGN_CENTER, // Port
+		tablewriter.ALIGN_CENTER, // Pings
+	})
+
 	table.SetHeaderColor(
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
@@ -229,9 +285,14 @@ func main() {
 	)
 
 	table.SetColumnColor(
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
+		tablewriter.Colors{tablewriter.FgMagentaColor},
+		tablewriter.Colors{tablewriter.FgGreenColor},
+		tablewriter.Colors{tablewriter.FgYellowColor},
+		tablewriter.Colors{tablewriter.FgHiRedColor},
 		tablewriter.Colors{tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.FgYellowColor},
-		tablewriter.Colors{tablewriter.FgYellowColor},
+		tablewriter.Colors{tablewriter.FgBlueColor},
+		tablewriter.Colors{tablewriter.FgBlueColor},
 		tablewriter.Colors{tablewriter.FgWhiteColor},
 	)
 
@@ -240,23 +301,26 @@ func main() {
 	table.SetAutoMergeCells(false)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 
+	i := 1
 	for _, result := range resultsList {
-		pings := strings.Join(result.pings, ", ")
+		pings := strings.Join(result.pings, " ")
+		groupStr := ""
+		if result.group > 0 {
+			groupStr = strconv.Itoa(result.group)
+		}
 		table.Append([]string{
-			result.host,
+			strconv.Itoa(i),
+			groupStr,
+			result.user,
+			result.hostname,
+			result.os,
+			result.ip,
 			result.externalIP,
 			result.port,
 			pings,
 		})
+
+		i++
 	}
 	table.Render()
-}
-
-func calculateAverage(pings []string) float64 {
-	sum := 0
-	for _, p := range pings {
-		val, _ := strconv.Atoi(p)
-		sum += val
-	}
-	return float64(sum) / float64(len(pings))
 }

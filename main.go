@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -13,11 +16,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/schollz/progressbar/v3"
 )
 
+// PingResult
 type PingResult struct {
 	ip         string
 	hostname   string
@@ -27,6 +32,48 @@ type PingResult struct {
 	port       string
 	pings      []string
 	group      string
+	isp        string
+}
+
+// IPInfo represents the JSON structure returned by ip-api.com
+type IPInfo struct {
+	Status    string  `json:"status"`
+	ISP       string  `json:"isp"`
+	Country   string  `json:"country"`
+	Region    string  `json:"regionName"`
+	City      string  `json:"city"`
+	Latitude  float64 `json:"lat"`
+	Longitude float64 `json:"lon"`
+	Query     string  `json:"query"`
+}
+
+// getIPInfo fonksiyonu ekleyelim
+func getIPInfo(ip string) (string, error) {
+	if ip == "" {
+		return "", nil
+	}
+
+	// Rate limiting için kısa bir bekleme
+	time.Sleep(100 * time.Millisecond)
+
+	url := fmt.Sprintf("http://ip-api.com/json/%s", ip)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var info IPInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return "", err
+	}
+
+	return info.ISP, nil
 }
 
 // Helper function to convert number to letter group with count
@@ -108,6 +155,7 @@ func checkTailscale() error {
 func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
 	defer wg.Done()
 
+	// Ping işlemi
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
@@ -132,14 +180,15 @@ func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
 
 	lines := strings.Split(string(output), "\n")
 
-	if len(lines) > 3 {
-		lines = lines[len(lines)-4:]
-	}
-
 	for _, line := range lines {
 		if match := publicIPPattern.FindStringSubmatch(line); match != nil {
 			result.externalIP = match[1]
 			result.port = match[2]
+
+			// ISP bilgisini al
+			if isp, err := getIPInfo(result.externalIP); err == nil {
+				result.isp = isp
+			}
 		}
 		if match := pingPattern.FindStringSubmatch(line); match != nil {
 			result.pings = append(result.pings, match[1])
@@ -208,12 +257,11 @@ func main() {
 
 	var wg sync.WaitGroup
 	var completed int32
-	total := int32(len(resultsList))
 
-	bar := progressbar.NewOptions(int(total),
+	bar := progressbar.NewOptions(len(resultsList),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionSetWidth(15),
-		progressbar.OptionSetDescription("[cyan]Pinging...[reset]"),
+		progressbar.OptionSetDescription("[cyan]Getting ISP info...[reset]"),
 		progressbar.OptionSetTheme(progressbar.Theme{
 			Saucer:        "[green]=[reset]",
 			SaucerHead:    "[green]>[reset]",
@@ -274,7 +322,7 @@ func main() {
 	})
 
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"#", "User", "Hostname", "OS", "Tailscale IP", "Group", "External IP", "Port", "Ping"})
+	table.SetHeader([]string{"#", "User", "Hostname", "OS", "Tailscale IP", "Group", "External IP", "Port", "Ping", "ISP"})
 	table.SetAutoFormatHeaders(false)
 
 	table.SetColumnAlignment([]int{
@@ -287,9 +335,11 @@ func main() {
 		tablewriter.ALIGN_LEFT,
 		tablewriter.ALIGN_CENTER,
 		tablewriter.ALIGN_RIGHT,
+		tablewriter.ALIGN_LEFT,
 	})
 
 	table.SetHeaderColor(
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
 		tablewriter.Colors{tablewriter.FgHiGreenColor},
@@ -311,6 +361,7 @@ func main() {
 		tablewriter.Colors{tablewriter.FgCyanColor},
 		tablewriter.Colors{tablewriter.FgCyanColor},
 		tablewriter.Colors{tablewriter.FgWhiteColor},
+		tablewriter.Colors{tablewriter.FgHiGreenColor},
 	)
 
 	table.SetBorder(true)
@@ -336,6 +387,7 @@ func main() {
 			result.externalIP,
 			result.port,
 			avgPingStr,
+			result.isp,
 		})
 		i++
 	}

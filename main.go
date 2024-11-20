@@ -26,7 +26,15 @@ type PingResult struct {
 	externalIP string
 	port       string
 	pings      []string
-	group      int
+	group      string
+}
+
+// Helper function to convert number to letter group with count
+func numberToLetterWithCount(n int, count int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s (%d)", string(rune('A'+(n-1))), count)
 }
 
 func getTailscaleStatus() ([]PingResult, error) {
@@ -98,7 +106,7 @@ func checkTailscale() error {
 }
 
 func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
-	defer wg.Done() // Only one Done() call here
+	defer wg.Done()
 
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
@@ -123,6 +131,11 @@ func pingIP(result *PingResult, wg *sync.WaitGroup, completed *int32) {
 	pingPattern := regexp.MustCompile(`in (\d+)ms`)
 
 	lines := strings.Split(string(output), "\n")
+
+	if len(lines) > 3 {
+		lines = lines[len(lines)-4:]
+	}
+
 	for _, line := range lines {
 		if match := publicIPPattern.FindStringSubmatch(line); match != nil {
 			result.externalIP = match[1]
@@ -142,14 +155,13 @@ func isPublicIP(ip string) bool {
 		return false
 	}
 
-	// Define private IP ranges
 	privateBlocks := []string{
 		"10.0.0.0/8",
 		"127.0.0.0/8",
 		"172.16.0.0/12",
 		"192.168.0.0/16",
-		"169.254.0.0/16", // Link-local addresses
-		"100.64.0.0/10",  // Carrier-grade NAT
+		"169.254.0.0/16",
+		"100.64.0.0/10",
 	}
 
 	for _, cidr := range privateBlocks {
@@ -159,7 +171,6 @@ func isPublicIP(ip string) bool {
 		}
 	}
 
-	// If not private, it's public
 	return true
 }
 
@@ -199,7 +210,6 @@ func main() {
 	var completed int32
 	total := int32(len(resultsList))
 
-	// Progress bar setup
 	bar := progressbar.NewOptions(int(total),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionSetWidth(15),
@@ -213,11 +223,10 @@ func main() {
 		}),
 		progressbar.OptionSetWriter(os.Stderr),
 		progressbar.OptionOnCompletion(func() {
-			fmt.Fprintf(os.Stderr, "\n") // Add newline after progress bar completion
+			fmt.Fprintf(os.Stderr, "\n")
 		}),
 	)
 
-	// Start ping goroutines
 	for i := range resultsList {
 		wg.Add(1)
 		go func(result *PingResult) {
@@ -228,20 +237,30 @@ func main() {
 
 	wg.Wait()
 
-	// Assign group numbers based on external IP if external IP is not empty and is public
+	// Use maps to track group numbers and counts
 	groupMap := make(map[string]int)
 	groupCounter := 1
+	groupCounts := make(map[string]int)
 
+	// First pass: Count devices per external IP
+	for _, result := range resultsList {
+		if result.externalIP != "" && isPublicIP(result.externalIP) {
+			groupCounts[result.externalIP]++
+		}
+	}
+
+	// Second pass: Assign groups with counts
 	for i := range resultsList {
 		externalIP := resultsList[i].externalIP
 		if externalIP == "" || !isPublicIP(externalIP) {
-			continue // Skip if external IP is empty or not public
+			continue
 		}
 		if _, exists := groupMap[externalIP]; !exists {
 			groupMap[externalIP] = groupCounter
 			groupCounter++
 		}
-		resultsList[i].group = groupMap[externalIP]
+		count := groupCounts[externalIP]
+		resultsList[i].group = numberToLetterWithCount(groupMap[externalIP], count)
 	}
 
 	// Sort the resultsList
@@ -254,22 +273,20 @@ func main() {
 		return iAvg < jAvg
 	})
 
-	// Table setup and render
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"#", "User", "Hostname", "OS", "Tailscale IP", "Group", "External IP", "Port", "Pings (ms)"})
+	table.SetHeader([]string{"#", "User", "Hostname", "OS", "Tailscale IP", "Group", "External IP", "Port", "Ping"})
 	table.SetAutoFormatHeaders(false)
 
-	// Add this line to set column alignments
 	table.SetColumnAlignment([]int{
-		tablewriter.ALIGN_LEFT,   // #
-		tablewriter.ALIGN_LEFT,   // User
-		tablewriter.ALIGN_LEFT,   // Hostname
-		tablewriter.ALIGN_CENTER, // OS
-		tablewriter.ALIGN_LEFT,   // Tailscale IP
-		tablewriter.ALIGN_CENTER, // Group
-		tablewriter.ALIGN_LEFT,   // External IP
-		tablewriter.ALIGN_CENTER, // Port
-		tablewriter.ALIGN_RIGHT,  // Pings
+		tablewriter.ALIGN_LEFT,
+		tablewriter.ALIGN_LEFT,
+		tablewriter.ALIGN_LEFT,
+		tablewriter.ALIGN_CENTER,
+		tablewriter.ALIGN_LEFT,
+		tablewriter.ALIGN_CENTER,
+		tablewriter.ALIGN_LEFT,
+		tablewriter.ALIGN_CENTER,
+		tablewriter.ALIGN_RIGHT,
 	})
 
 	table.SetHeaderColor(
@@ -303,23 +320,23 @@ func main() {
 
 	i := 1
 	for _, result := range resultsList {
-		pings := strings.Join(result.pings, " ")
-		groupStr := ""
-		if result.group > 0 {
-			groupStr = strconv.Itoa(result.group)
+		avgPing := calculateAverage(result.pings)
+		avgPingStr := "-"
+		if avgPing > 0 {
+			avgPingStr = fmt.Sprintf("%.1f", avgPing)
 		}
+
 		table.Append([]string{
 			strconv.Itoa(i),
 			result.user,
 			result.hostname,
 			result.os,
 			result.ip,
-			groupStr,
+			result.group,
 			result.externalIP,
 			result.port,
-			pings,
+			avgPingStr,
 		})
-
 		i++
 	}
 	table.Render()

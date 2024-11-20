@@ -380,16 +380,33 @@ func main() {
 		table.Append([]string{
 			strconv.Itoa(i),
 			result.user,
-			result.hostname,
+			trimHostname(result.hostname),
 			result.os,
 			result.ip,
 			result.group,
 			result.externalIP,
 			result.port,
 			avgPingStr,
-			result.isp,
+			trimISP(result.isp),
 		})
 		i++
 	}
 	table.Render()
+}
+
+func trimISP(isp string) string {
+	parts := strings.Fields(isp) // Split by whitespace
+	if len(parts) > 0 {
+		return parts[0] // Return the first part
+	}
+	return isp // Return original if no whitespace found
+}
+
+func trimHostname(hostname string) string {
+	// Split the hostname by the dot
+	parts := strings.Split(hostname, ".")
+	if len(parts) > 0 {
+		return parts[0] // Return the first part
+	}
+	return hostname // Return the original hostname if no dot is found
 }
